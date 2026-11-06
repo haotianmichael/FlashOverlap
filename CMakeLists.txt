@@ -17,9 +17,13 @@ endif()
 link_libraries( "$<$<AND:$<CXX_COMPILER_ID:GNU>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,9.0>>:-lstdc++fs>" )
 
 # Set up C++ standard
-set(CXX_STD "17" CACHE STRING "C++ standard")
+# [modified] Recent PyTorch headers require C++20 (was 17).
+#            Also apply the standard to CUDA sources, otherwise nvcc stays at its default (C++17).
+set(CXX_STD "20" CACHE STRING "C++ standard")
 set(CMAKE_CXX_STANDARD ${CXX_STD})
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD ${CXX_STD})
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if (BUILD_MODE)
   string(TOUPPER ${BUILD_MODE} BUILD_MODE)
@@ -41,21 +45,57 @@ set(COMMON_HEADER_DIRS
 )
 set(COMMON_LIB_DIRS "")
 
+# [modified] Moved up from the Python section: needed earlier to locate pip-installed NCCL.
+set(PYTHON_PATH "python" CACHE STRING "Python path")
+
 # Set up MPI and NCCL for multi-GPU communication
 message("Building with MPI and NCCL")
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
+
+# [added] Prefer the NCCL shipped with PyTorch (pip package nvidia-nccl-*), so this
+#         project and torch load the same libnccl.so.2. Skipped if the user passes
+#         -DNCCL_INCLUDE_DIRS / -DNCCL_LIBRARIES; falls back to FindNCCL's normal search
+#         if the package is not installed.
+if (NOT NCCL_INCLUDE_DIRS OR NOT NCCL_LIBRARIES)
+  execute_process(COMMAND ${PYTHON_PATH} "-c" "import nvidia.nccl as m; print(list(m.__path__)[0], end='')"
+                  RESULT_VARIABLE _NCCL_PY_RESULT
+                  OUTPUT_VARIABLE _NCCL_PY_DIR
+                  ERROR_QUIET)
+  if (_NCCL_PY_RESULT EQUAL 0
+      AND EXISTS "${_NCCL_PY_DIR}/include/nccl.h"
+      AND EXISTS "${_NCCL_PY_DIR}/lib/libnccl.so.2")
+    message(STATUS "Using NCCL from Python package: ${_NCCL_PY_DIR}")
+    if (NOT NCCL_INCLUDE_DIRS)
+      set(NCCL_INCLUDE_DIRS "${_NCCL_PY_DIR}/include" CACHE PATH "NCCL include directory" FORCE)
+    endif()
+    if (NOT NCCL_LIBRARIES)
+      set(NCCL_LIBRARIES "${_NCCL_PY_DIR}/lib/libnccl.so.2" CACHE FILEPATH "NCCL library" FORCE)
+    endif()
+  endif()
+endif()
+
 # set(MKL_MPI "openmpi")
 find_package(NCCL REQUIRED)
 # find_package(MPI REQUIRED)
 set(CMAKE_MODULE_PATH "") # prevent the bugs for pytorch building
 
-list(APPEND COMMON_HEADER_DIRS ${MPI_INCLUDE_PATH} ${NCCL_INCLUDE_DIR})
-list(APPEND COMMON_LIB_DIRS ${MPI_LIBRARIES} ${NCCL_LIBRARIES})
+# [added] The pip package only ships libnccl.so.2 (no libnccl.so), so '-lnccl' cannot
+#         resolve. Provide a libnccl.so symlink inside the build tree (site-packages untouched).
+set(NCCL_LINK_DIR ${CMAKE_BINARY_DIR}/nccl_link)
+file(MAKE_DIRECTORY ${NCCL_LINK_DIR})
+file(CREATE_LINK ${NCCL_LIBRARIES} ${NCCL_LINK_DIR}/libnccl.so SYMBOLIC)
+
+# [modified] NCCL_INCLUDE_DIR -> NCCL_INCLUDE_DIRS: the former is only an (usually empty)
+#            input hint of FindNCCL; the latter is its result.
+list(APPEND COMMON_HEADER_DIRS ${MPI_INCLUDE_PATH} ${NCCL_INCLUDE_DIRS})
+# [modified] link_directories() expects directories, not library files.
+list(APPEND COMMON_LIB_DIRS ${MPI_LIBRARIES} ${NCCL_LINK_DIR})
 
 set(COMMON_LIBS CUDA::cudart)
+# [added] Link NCCL by full path; CMake then also puts its directory into the build RPATH.
+list(APPEND COMMON_LIBS ${NCCL_LIBRARIES})
 
 # Add Python into COMMON_HEADER_DIRS & COMMON_LIB_DIRS
-set(PYTHON_PATH "python" CACHE STRING "Python path")
 execute_process(COMMAND ${PYTHON_PATH} "-c" "import sysconfig;
 print(sysconfig.get_paths()['include']);"
                   RESULT_VARIABLE _PYTHON_SUCCESS
@@ -75,6 +115,17 @@ if (NOT _PYTHON_SUCCESS MATCHES 0)
 endif()
 list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
 set(CAFFE2_USE_CUDNN 0)
+
+# [added] Torch's bundled legacy FindCUDA only searches <cuda_root>/include, but conda's
+#         CUDA 12/13 packages put headers in <cuda_root>/targets/<arch>/include.
+#         Point it at the header directory already found by FindCUDAToolkit.
+if (NOT CUDA_TOOLKIT_INCLUDE)
+  find_path(_FO_CUDA_RUNTIME_INC cuda_runtime.h HINTS ${CUDAToolkit_INCLUDE_DIRS} NO_DEFAULT_PATH)
+  if (_FO_CUDA_RUNTIME_INC)
+    set(CUDA_TOOLKIT_INCLUDE ${_FO_CUDA_RUNTIME_INC} CACHE PATH "CUDA toolkit include directory" FORCE)
+  endif()
+endif()
+
 find_package(Torch REQUIRED)
 list(APPEND COMMON_HEADER_DIRS "${TORCH_INCLUDE_DIRS}")
 list(APPEND COMMON_LIBS "${TORCH_LIBRARIES}")
