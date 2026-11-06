@@ -8,14 +8,47 @@ import torch
 import argparse
 import pandas as pd
 import json
+import os
 from pathlib import Path
 import torch.multiprocessing as mp
 import numpy as np
 
 torch.ops.load_library("../build/lib/libst_pybinding.so")
 
+# [patched] SMs occupied by the NCCL kernel while it runs: one per NCCL channel ("coll channels"
+#           in the NCCL_DEBUG=INFO log). Upstream hard-codes 2. Set with --comm_sms.
+COMM_SMS = 2
+
 def div_up(x: int, y: int):
     return (x + y - 1) // y
+
+def get_wave_size():
+    # [patched] tiles per wave while NCCL is running (upstream: SM count - 2)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.multi_processor_count - COMM_SMS
+
+def build_hint(samples, tile_num: int, w_size: int):
+    '''
+    [patched] samples[s][t] is the completion position of tile t in run s.
+
+    Upstream accepts a GEMM config only if, in every run, each group of w_size consecutive
+    completions holds exactly the same tiles, and raises "Tuning fails!" if no config does.
+    Here the tiles are ordered by their mean completion position instead, so a hint is always
+    produced; when the order is fully repeatable this gives the same groups as upstream.
+    The hint only decides when each segment's communication can start (the wait kernel still
+    waits for every tile of its segment), so it does not change the result.
+
+    Returns (consistent, num_unstable, hint): num_unstable counts the tiles that land in
+    different groups across runs.
+    '''
+    expected = list(range(tile_num))
+    if any(sorted(row) != expected for row in samples):
+        print("[hint] WARNING: monitored completion positions are not a permutation of the tiles")
+        return False, tile_num, expected
+    cols = list(zip(*samples))
+    num_unstable = sum(1 for c in cols if min(c) // w_size != max(c) // w_size)
+    hint = sorted(range(tile_num), key=lambda t: (sum(cols[t]), t))
+    return num_unstable == 0, num_unstable, hint
 
 def load_json(M: int, N: int, K: int):
     device = torch.cuda.current_device()
@@ -28,7 +61,12 @@ def load_json(M: int, N: int, K: int):
     # 如果文件存在，加载 JSON 数据
     with open(file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
+
+    # [patched] save_solution() replaces the candidate lists with the chosen config but keeps
+    #           the lists under cand_*, so search.py can be run again without re-profiling.
+    if not isinstance(data["Algo"], list):
+        assert "cand_Algo" in data, f"{file_path} holds no GEMM candidates; run profile_config.py again"
+        return data["cand_BM"], data["cand_BN"], data["cand_dur"], data["cand_Algo"]
     return data["BM"], data["BN"], data["dur"], data["Algo"]
 
 def save_solution(M: int, N: int, K: int, BM: int, BN: int, gemm_dur: float, Algo: int, hint: list, cSeg: list):
@@ -39,7 +77,12 @@ def save_solution(M: int, N: int, K: int, BM: int, BN: int, gemm_dur: float, Alg
     
     with open(file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
+
+    # [patched] keep the profiled candidates (see load_json)
+    if isinstance(data.get("Algo"), list):
+        for key in ("BM", "BN", "dur", "Algo"):
+            data["cand_" + key] = data[key]
+
     data["hint"] = hint
     data["cSeg"] = cSeg
     data["rLDN"] = 1
@@ -142,19 +185,10 @@ def compute_hint_process(rank, world_size, nccl_id,
         assert comm_op in ["all_reduce", "reduce_scatter"], \
             f"comm_op must be 'all_reduce' or 'reduce_scatter', but got '{comm_op}'"
 
-    hint = []
-    is_consistency = True
-    for w in range(WaveNum):
-        index = torch.where(((samples >= w * wSize) * (samples < (w + 1) * wSize)).sum(dim=0) == 10)
+    # [patched] order the tiles by mean completion position instead of failing (see build_hint)
+    is_consistency, num_unstable, hint = build_hint(samples.cpu().tolist(), TileNum, wSize)
 
-        if w < WaveNum - 1:
-            if index[0].shape[0] < wSize:
-                is_consistency = False
-                break
-
-        hint = hint + index[0].tolist()
-        
-    result_dict[rank] = (is_consistency, hint)
+    result_dict[rank] = (is_consistency, hint, num_unstable)
 
 def compute_hint(M: int, N: int, K: int,
     BM: int, BN: int, Algo: list, wSize: int, comm_op: str):
@@ -219,8 +253,9 @@ def predict_lat(M: int, N: int, gemm_dur: float,
         acc_comm_dur = interpolate_latency(comm_array, M*N // tile_num * gp[0], comm_op) + gemm_dur
         return acc_comm_dur
 
+    wave_size = sm_count - COMM_SMS  # [patched] upstream: sm_count - 2
     old_wave_num = (tile_num + sm_count - 1) // sm_count
-    new_wave_num = (tile_num + sm_count - 3) // (sm_count - 2)
+    new_wave_num = div_up(tile_num, wave_size)
     gemm_dur = gemm_dur / old_wave_num * new_wave_num
 
     for i in range(iter_num):
@@ -229,7 +264,7 @@ def predict_lat(M: int, N: int, gemm_dur: float,
         else:
             comm_dur = interpolate_latency(comm_array, M*N // tile_num * gp[i - 1], comm_op)
         acc_comm_dur = max(acc_comp_dur, acc_comm_dur) + comm_dur 
-        acc_comp_dur += gemm_dur / new_wave_num * ((gp[i] + sm_count - 3) // (sm_count - 2))
+        acc_comp_dur += gemm_dur / new_wave_num * div_up(gp[i], wave_size)
     acc_comm_dur = max(acc_comp_dur, acc_comm_dur) + interpolate_latency(comm_array, M*N // tile_num * gp[-1], comm_op)
 
     return acc_comm_dur
@@ -384,33 +419,60 @@ def integer_partitions(n):
     helper(n, [])
     return result
 
-def exhaustive_search(M: int, N: int, K: int, comm_op: str):
-    # load the .json file
+def select_config(M: int, N: int, K: int, comm_op: str, num_cand: int, waves_per_group):
+    '''
+    [patched] Like upstream, try the profiled GEMM configs fastest-first and stop at the first
+    one whose tile completion order is fully repeatable. If none is, use the config with the
+    fewest unstable tiles (see build_hint) instead of failing with "Tuning fails!".
+    '''
     BM_list, BN_list, gemm_dur_list, Algo_list = load_json(M, N, K)
+    wave_size = get_wave_size()
 
-    # get the SM count
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
-    sm_count = props.multi_processor_count
-
-    hint = None
-    for t in range(5):
+    best = None
+    for t in range(min(num_cand, len(Algo_list))):
         BM = BM_list[t]
         BN = BN_list[t]
         gemm_dur = gemm_dur_list[t]
         Algo = Algo_list[t]
 
         tile_num = div_up(M, BM) * div_up(N, BN)
-        wave_num = div_up(tile_num, (sm_count - 2))
+        wave_num = div_up(tile_num, wave_size)
+        group_waves = waves_per_group(wave_num)
+        seg_num = div_up(tile_num, group_waves * wave_size)
+        tile_cols = div_up(N, BN)
+        if seg_num >= tile_cols:
+            # the per-segment counters and the global counter share one row of tile_cols ints
+            print(f"[hint] config {t} (BM={BM} BN={BN} Algo={Algo}): skipped, needs {seg_num} "
+                  f"segment counters but the counter row has room for {tile_cols - 1}")
+            continue
 
         #compute hint
-        result = compute_hint(M, N, K, BM, BN, Algo, (sm_count - 2), comm_op)
+        consistent, hint, num_unstable = compute_hint(
+            M, N, K, BM, BN, Algo, group_waves * wave_size, comm_op)
+        print(f"[hint] config {t} (BM={BM} BN={BN} Algo={Algo}, gemm {gemm_dur:.4f} ms): "
+              f"{num_unstable}/{tile_num} tiles change group across runs")
 
-        if result[0] == True:
-            hint = result[1]
+        # configs differ in tile count, so compare the unstable fraction; ties keep the faster GEMM
+        if best is None or num_unstable * best["tile_num"] < best["num_unstable"] * tile_num:
+            best = dict(idx=t, BM=BM, BN=BN, gemm_dur=gemm_dur, Algo=Algo, tile_num=tile_num,
+                        wave_num=wave_num, group_waves=group_waves, hint=hint,
+                        num_unstable=num_unstable)
+        if consistent:
             break
 
-    assert hint != None, "Tuning fails! Try to increase min_group_size manully."
+    assert best is not None, "No profiled GEMM config can be used for this shape."
+    if best["num_unstable"] > 0:
+        print(f"[hint] No config has a fully repeatable tile order; using config {best['idx']} "
+              f"(BM={best['BM']} BN={best['BN']} Algo={best['Algo']}) with the tiles ordered "
+              f"by mean completion position.")
+    return best
+
+def exhaustive_search(M: int, N: int, K: int, comm_op: str):
+    # [patched] config and hint selection moved to select_config(); one wave per group as upstream
+    cfg = select_config(M, N, K, comm_op, 5, lambda wave_num: 1)
+    BM, BN, gemm_dur, Algo = cfg["BM"], cfg["BN"], cfg["gemm_dur"], cfg["Algo"]
+    tile_num, wave_num, hint = cfg["tile_num"], cfg["wave_num"], cfg["hint"]
+    wave_size = get_wave_size()
     print("Start exhaustive searching.")
 
     min_dur = 1e5
@@ -423,10 +485,10 @@ def exhaustive_search(M: int, N: int, K: int, comm_op: str):
         acc = 0
         for j in range(iter_num):
             if j < iter_num - 1:
-                gp[j] = gp[j] * (sm_count - 2)
+                gp[j] = gp[j] * wave_size
                 acc += gp[j]
             else:
-                gp[j] = min(gp[j] * (sm_count - 2), tile_num - acc)
+                gp[j] = min(gp[j] * wave_size, tile_num - acc)
         dur = perf_running(M, N, K, BM, BN, Algo, gp, hint, comm_op)
         print(gp, "%.4f" % (dur))
 
@@ -440,34 +502,13 @@ def exhaustive_search(M: int, N: int, K: int, comm_op: str):
 
 
 def fast_search(M: int, N: int, K: int, comm_array: torch.Tensor, comm_op: str):
-    # load the .json file
-    BM_list, BN_list, gemm_dur_list, Algo_list = load_json(M, N, K)
-
-    # get the SM count
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
-    sm_count = props.multi_processor_count
-
-    hint = None
-    for t in range(10):
-        BM = BM_list[t]
-        BN = BN_list[t]
-        gemm_dur = gemm_dur_list[t]
-        Algo = Algo_list[t]
-
-        tile_num = div_up(M, BM) * div_up(N, BN)
-        wave_num = div_up(tile_num, (sm_count - 2))
-
-        min_group_size = div_up(wave_num, 10)
-
-        #compute hint
-        result = compute_hint(M, N, K, BM, BN, Algo, min_group_size * (sm_count - 2), comm_op)
-
-        if result[0] == True:
-            hint = result[1]
-            break
-
-    assert hint != None, "Tuning fails! Try to increase min_group_size manully."
+    # [patched] config and hint selection moved to select_config(); groups of
+    #           div_up(wave_num, 10) waves as upstream
+    cfg = select_config(M, N, K, comm_op, 10, lambda wave_num: div_up(wave_num, 10))
+    BM, BN, gemm_dur, Algo = cfg["BM"], cfg["BN"], cfg["gemm_dur"], cfg["Algo"]
+    tile_num, wave_num, hint = cfg["tile_num"], cfg["wave_num"], cfg["hint"]
+    min_group_size = cfg["group_waves"]
+    wave_size = get_wave_size()
     print("Start predictive searching.")
     
     min_dur = 1e5
@@ -484,10 +525,10 @@ def fast_search(M: int, N: int, K: int, comm_array: torch.Tensor, comm_op: str):
             continue
         for j in range(iter_num):
             if j < iter_num - 1:
-                gp[j] = gp[j] * (sm_count - 2) * min_group_size
+                gp[j] = gp[j] * wave_size * min_group_size
                 acc += gp[j]
             else:
-                gp[j] = min(gp[j] * (sm_count - 2) * min_group_size, tile_num - acc)
+                gp[j] = min(gp[j] * wave_size * min_group_size, tile_num - acc)
         est_dur = predict_lat(M, N, gemm_dur, comm_array, gp, tile_num, comm_op)
         
         if est_dur < min_dur:
@@ -513,7 +554,19 @@ def main():
     parser.add_argument('--n', type=int, default=8192)
     parser.add_argument('--comm_op', type=str, default='all_reduce')
     parser.add_argument('--predictive_search', type=bool, default=False)
+    # [patched]
+    parser.add_argument('--comm_sms', type=int, default=2,
+                        help='SMs occupied by NCCL while it runs (= "coll channels" in the '
+                             'NCCL_DEBUG=INFO log); upstream assumes 2')
     args = parser.parse_args()
+
+    global COMM_SMS
+    COMM_SMS = args.comm_sms
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    print(f"[patched] SMs: {sm_count}, SMs for NCCL: {COMM_SMS}, tiles per wave: {sm_count - COMM_SMS}")
+    nccl_env = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+    if nccl_env:
+        print(f"[patched] NCCL environment: {nccl_env}")
 
     # Force to use predictive search if the workload is large
     if args.predictive_search or args.m * args.n > 33554432:
